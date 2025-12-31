@@ -1,0 +1,11 @@
+{
+  "mainnet": {
+    "relayUrl": "",
+    "nostrHexPubkey": ""
+  },
+  "testnet": {
+    "relayUrl": "",
+    "nostrHexPubkey": ""
+  }
+}
+

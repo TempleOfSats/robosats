@@ -36,6 +36,7 @@ import {
   Warning,
   Tag,
   Description,
+  MilitaryTech,
 } from '@mui/icons-material';
 import { fiatMethods, PaymentStringAsIcons, swapMethods } from '../../components/PaymentMethods';
 import { FlagWithProps, SendReceiveIcon } from '../Icons';
@@ -45,6 +46,7 @@ import { pn, amountToString, computeSats, statusBadgeColor } from '../../utils';
 import TakeButton from './TakeButton';
 import { F2fMapDialog, OrderDescriptionDialog } from '../Dialogs';
 import { type UseFederationStoreType, FederationContext } from '../../contexts/FederationContext';
+import { type UseGarageStoreType, GarageContext } from '../../contexts/GarageContext';
 import { Coordinator, type Order } from '../../models';
 import { Box } from '@mui/system';
 
@@ -66,6 +68,9 @@ const OrderDetails = ({
   const { t } = useTranslation();
   const theme = useTheme();
   const { federation } = useContext<UseFederationStoreType>(FederationContext);
+  const { garage, slotUpdatedAt } = useContext<UseGarageStoreType>(GarageContext);
+  const [reputationEnabled, setReputationEnabled] = useState<boolean>(false);
+  const [reputationHasMasterKey, setReputationHasMasterKey] = useState<boolean>(false);
   const [coordinator, setCoordinator] = useState<Coordinator | null>(
     federation.getCoordinator(shortAlias),
   );
@@ -74,6 +79,18 @@ const OrderDetails = ({
   const [openWarningDialog, setOpenWarningDialog] = useState<boolean>(false);
   const [password, setPassword] = useState<string>();
   const [openDescription, setOpenDescription] = useState<boolean>(false);
+  const [buyerBadgeTier, setBuyerBadgeTier] = useState<
+    'none' | 'beginner' | 'intermediate' | 'experienced' | 'optin' | 'unknown' | 'unavailable'
+  >('optin');
+  const [buyerBadgeReported, setBuyerBadgeReported] = useState<boolean>(false);
+
+  useEffect(() => {
+    void (async () => {
+      const enabled = await garage.getReputationEnabled();
+      setReputationEnabled(enabled);
+      setReputationHasMasterKey(await garage.hasReputationMasterKey());
+    })();
+  }, [slotUpdatedAt]);
 
   useEffect(() => {
     setCoordinator(federation.getCoordinator(shortAlias));
@@ -83,6 +100,197 @@ const OrderDetails = ({
   useEffect(() => {
     if (!coordinator?.info) coordinator?.loadInfo();
   }, [coordinator.shortAlias, coordinator.info]);
+
+  const buyerPubKey = useMemo(() => {
+    if (currentOrder.type === 0) return currentOrder.maker_nostr_pubkey;
+    if (currentOrder.type === 1) return currentOrder.taker_nostr_pubkey;
+    return undefined;
+  }, [currentOrder.type, currentOrder.maker_nostr_pubkey, currentOrder.taker_nostr_pubkey]);
+
+  const isSwap = useMemo(() => {
+    return (
+      currentOrder.currency === 1000 ||
+      Boolean(currentOrder.maker_summary?.is_swap) ||
+      Boolean(currentOrder.taker_summary?.is_swap)
+    );
+  }, [currentOrder.currency, currentOrder.maker_summary?.is_swap, currentOrder.taker_summary?.is_swap]);
+
+  useEffect(() => {
+    if (isSwap || currentOrder.is_seller) {
+      setBuyerBadgeTier('unknown');
+      setBuyerBadgeReported(false);
+      return;
+    }
+    if (!buyerPubKey) {
+      setBuyerBadgeTier('unknown');
+      setBuyerBadgeReported(false);
+      return;
+    }
+    if (!federation.notaryPool.relayUrl || !federation.notaryPool.notaryPubKey) {
+      setBuyerBadgeTier('unavailable');
+      setBuyerBadgeReported(false);
+      return;
+    }
+
+    // Badge is opt-in: default to a muted state until the notary publishes a badge assertion.
+    setBuyerBadgeTier('optin');
+    setBuyerBadgeReported(false);
+    federation.notaryPool.subscribeBuyerBadges(
+      {
+        oneose: () => {},
+        onevent: (event) => {
+          if (event.pubkey !== federation.notaryPool.notaryPubKey) return;
+
+          const p = event.tags.find((t) => t[0] === 'p')?.[1];
+          if (p !== buyerPubKey) return;
+
+          const net = event.tags.find((t) => t[0] === 'net')?.[1];
+          if (net && net !== federation.network) return;
+
+          const tier = event.tags.find((t) => t[0] === 'tier')?.[1];
+          if (tier === 'beginner' || tier === 'intermediate' || tier === 'experienced' || tier === 'none') {
+            setBuyerBadgeTier(tier);
+          }
+
+          const reported = event.tags.find((t) => t[0] === 'reported')?.[1];
+          setBuyerBadgeReported(reported === '1' || reported === 'true');
+        },
+      },
+      [buyerPubKey],
+      `${shortAlias}:${currentOrder.id}`,
+    );
+  }, [
+    buyerPubKey,
+    currentOrder.id,
+    currentOrder.is_seller,
+    federation.network,
+    federation.notaryPool.relayUrl,
+    federation.notaryPool.notaryPubKey,
+    isSwap,
+    shortAlias,
+  ]);
+
+  const buyerBadgeLabel = useMemo(() => {
+    switch (buyerBadgeTier) {
+      case 'experienced':
+        return t('Experienced');
+      case 'intermediate':
+        return t('Intermediate');
+      case 'beginner':
+        return t('Beginner');
+      case 'none':
+        return t('New');
+      case 'optin':
+        return t('Opt-in');
+      case 'unavailable':
+        return t('Unavailable');
+      case 'unknown':
+      default:
+        return t('Unknown');
+    }
+  }, [buyerBadgeTier]);
+
+  const buyerBadgeDisplayLabel = useMemo(() => {
+    if (currentOrder.is_buyer && reputationEnabled && !reputationHasMasterKey) return t('Setup');
+    return buyerBadgeLabel;
+  }, [buyerBadgeLabel, currentOrder.is_buyer, reputationEnabled, reputationHasMasterKey, t]);
+
+  const showBuyerBadge = useMemo(() => {
+    if (isSwap) return false;
+    if (currentOrder.is_seller) return false;
+
+    // Always show to the buyer themselves (so they can see / manage their own badge).
+    if (currentOrder.is_buyer) return true;
+
+    // For everyone else, show only meaningful signals (avoid clutter / linkability):
+    // - show tiers (beginner+)
+    // - always show "Reported"
+    if (buyerBadgeReported) return true;
+    return buyerBadgeTier === 'beginner' || buyerBadgeTier === 'intermediate' || buyerBadgeTier === 'experienced';
+  }, [buyerBadgeReported, buyerBadgeTier, currentOrder.is_buyer, currentOrder.is_seller, isSwap]);
+
+  const buyerBadgeIsMuted = useMemo(() => {
+    return buyerBadgeTier === 'optin' || buyerBadgeTier === 'unavailable' || buyerBadgeTier === 'unknown';
+  }, [buyerBadgeTier]);
+
+  const buyerBadgeTooltip = useMemo(() => {
+    const tierInfo = t(
+      "Tiers: Beginner (>5). Intermediate (>10 and ≥90 days). Experienced (>30 and ≥120 days). Only successful BUY trades count (swaps excluded).",
+    );
+
+    if (buyerBadgeReported) {
+      return `${t('This buyer has been reported by a coordinator. Proceed with caution.')} ${tierInfo}`;
+    }
+    if (currentOrder.is_buyer && reputationEnabled && !reputationHasMasterKey) {
+      return `${t('Finish setup in Garage → Reputation')} ${tierInfo}`;
+    }
+    if (currentOrder.is_buyer && !reputationEnabled) {
+      return `${t('Enable it in Garage → Reputation')} ${tierInfo}`;
+    }
+    if (buyerBadgeTier === 'optin') {
+      return `${t(
+        'Buyer reputation is optional. If the buyer opted in, a third-party notary publishes a badge based on successful BUY trades.',
+      )} ${tierInfo}`;
+    }
+    if (buyerBadgeTier === 'unavailable') {
+      return t('Buyer reputation notary is not configured for this federation.');
+    }
+    if (buyerBadgeTier === 'unknown') {
+      return t('Buyer badge could not be determined.');
+    }
+    return `${t(
+      'Buyer reputation badge is computed by a third-party notary from successful BUY trades (tier only).',
+    )} ${tierInfo}`;
+  }, [
+    buyerBadgeReported,
+    buyerBadgeTier,
+    currentOrder.is_buyer,
+    reputationEnabled,
+    reputationHasMasterKey,
+    t,
+  ]);
+
+  const buyerBadgeSecondaryColor = useMemo(() => {
+    if (buyerBadgeReported) return 'error.main';
+    if (
+      buyerBadgeIsMuted ||
+      (currentOrder.is_buyer && !reputationEnabled) ||
+      (currentOrder.is_buyer && reputationEnabled && !reputationHasMasterKey)
+    ) {
+      return 'text.disabled';
+    }
+    return 'text.secondary';
+  }, [
+    buyerBadgeIsMuted,
+    buyerBadgeReported,
+    currentOrder.is_buyer,
+    reputationEnabled,
+    reputationHasMasterKey,
+  ]);
+
+  const buyerBadgeIconColor = useMemo(() => {
+    if (buyerBadgeReported) return 'error.main';
+    if (
+      buyerBadgeIsMuted ||
+      (currentOrder.is_buyer && !reputationEnabled) ||
+      (currentOrder.is_buyer && reputationEnabled && !reputationHasMasterKey)
+    ) {
+      return 'action.disabled';
+    }
+    return 'action.active';
+  }, [
+    buyerBadgeIsMuted,
+    buyerBadgeReported,
+    currentOrder.is_buyer,
+    reputationEnabled,
+    reputationHasMasterKey,
+  ]);
+
+  const buyerBadgeSecondary = useMemo(() => {
+    return buyerBadgeReported
+      ? `${buyerBadgeDisplayLabel} · ${t('Reported')}`
+      : buyerBadgeDisplayLabel;
+  }, [buyerBadgeDisplayLabel, buyerBadgeReported]);
 
   const amountString = useMemo(() => {
     if (currentOrder === null) return;
@@ -400,6 +608,21 @@ const OrderDetails = ({
                 <Typography variant='body2'>{satsSummary.receive}</Typography>
               </ListItem>
             </List>
+
+            {showBuyerBadge ? (
+              <Tooltip enterTouchDelay={0} title={buyerBadgeTooltip}>
+                <ListItem sx={{ paddingTop: 0 }}>
+                  <ListItemIcon>
+                    <MilitaryTech sx={{ color: buyerBadgeIconColor }} />
+                  </ListItemIcon>
+                  <ListItemText
+                    primary={t('Buyer badge')}
+                    secondary={buyerBadgeSecondary}
+                    secondaryTypographyProps={{ sx: { color: buyerBadgeSecondaryColor } }}
+                  />
+                </ListItem>
+              </Tooltip>
+            ) : null}
 
             <Divider />
 

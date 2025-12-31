@@ -1,12 +1,37 @@
 import pygeohash
 import hashlib
 import uuid
+import inspect
 
 from secp256k1 import PrivateKey
 from asgiref.sync import sync_to_async
 from nostr_sdk import Keys, Client, EventBuilder, NostrSigner, Kind, Tag, PublicKey
 from api.models import Order
 from decouple import config
+
+try:
+    # nostr_sdk >= 0.43 exposes RelayUrl; older versions don't.
+    from nostr_sdk import RelayUrl  # type: ignore
+except Exception:  # pragma: no cover
+    RelayUrl = None  # type: ignore
+
+
+async def _add_relay(client: Client, url: str) -> None:
+    """
+    nostr_sdk compatibility shim:
+    - Newer versions require a RelayUrl instance: RelayUrl.parse("ws(s)://...")
+    - Older versions accept a plain string.
+    """
+    try:
+        if RelayUrl is not None:
+            res = client.add_relay(RelayUrl.parse(url))
+        else:
+            res = client.add_relay(url)
+    except TypeError:
+        res = client.add_relay(url)
+
+    if inspect.isawaitable(res):
+        await res
 
 
 class Nostr:
@@ -70,12 +95,116 @@ class Nostr:
         client = Client(signer)
 
         # Add relays and connect
-        await client.add_relay("ws://localhost:7777")
+        await _add_relay(client, "ws://localhost:7777")
         strfry_port = config("STRFRY_PORT", cast=str, default="7778")
-        await client.add_relay(f"ws://localhost:{strfry_port}")
+        await _add_relay(client, f"ws://localhost:{strfry_port}")
         await client.connect()
 
         return client
+
+    async def send_buyer_success_receipt(self, order):
+        """
+        Creates a buyer success receipt event and sends it to the notary relay.
+
+        This is used for cross-coordinator buyer reputation badges.
+        """
+        if getattr(order, "is_swap", False):
+            return
+
+        if config("NOSTR_NSEC", cast=str, default="") == "":
+            return
+
+        notary_relays = self.get_notary_relays()
+        if len(notary_relays) == 0:
+            return
+
+        buyer_pubkey = await self.get_buyer_nostr_pubkey(order)
+        if not buyer_pubkey:
+            return
+
+        keys = Keys.parse(config("NOSTR_NSEC", cast=str))
+        client = await self.initialize_notary_client(keys, notary_relays)
+
+        network = str(config("NETWORK", cast=str))
+        tags = [
+            Tag.parse(["d", str(order.reference)]),
+            Tag.parse(["p", str(buyer_pubkey)]),
+            Tag.parse(["net", network]),
+            Tag.parse(["v", "1"]),
+        ]
+
+        event = (
+            EventBuilder(Kind(38384), "")
+            .tags(tags)
+            .sign_with_keys(keys)
+        )
+        await client.send_event(event)
+        print(f"Nostr BUYER SUCCESS receipt sent: {event.as_json()}")
+
+    async def send_buyer_scam_report(self, buyer_pubkey_hex: str, note: str = ""):
+        """
+        Creates a buyer scam report event and sends it to the notary relay.
+
+        Coordinators can send this for any buyer ephemeral pubkey, even after a trade concluded.
+        """
+        if not buyer_pubkey_hex:
+            return
+
+        if config("NOSTR_NSEC", cast=str, default="") == "":
+            return
+
+        notary_relays = self.get_notary_relays()
+        if len(notary_relays) == 0:
+            return
+
+        keys = Keys.parse(config("NOSTR_NSEC", cast=str))
+        client = await self.initialize_notary_client(keys, notary_relays)
+
+        network = str(config("NETWORK", cast=str))
+        buyer_pubkey_hex = buyer_pubkey_hex.lower()
+        tags = [
+            Tag.parse(["d", f"{network}:{buyer_pubkey_hex}"]),
+            Tag.parse(["p", buyer_pubkey_hex]),
+            Tag.parse(["net", network]),
+            Tag.parse(["report", "scammer"]),
+            Tag.parse(["v", "1"]),
+        ]
+
+        event = (
+            EventBuilder(Kind(38386), note or "")
+            .tags(tags)
+            .sign_with_keys(keys)
+        )
+        await client.send_event(event)
+        print(f"Nostr BUYER SCAM report sent: {event.as_json()}")
+
+    def get_notary_relays(self):
+        relays_str = config("NOSTR_NOTARY_RELAY_URLS", cast=str, default="").strip()
+        if relays_str:
+            return [u.strip() for u in relays_str.split(",") if u.strip()]
+        relay = config("NOSTR_NOTARY_RELAY_URL", cast=str, default="").strip()
+        return [relay] if relay else []
+
+    async def initialize_notary_client(self, keys, relays):
+        signer = NostrSigner.keys(keys)
+        client = Client(signer)
+        for relay in relays:
+            await _add_relay(client, relay)
+        await client.connect()
+        return client
+
+    @sync_to_async
+    def get_buyer_nostr_pubkey(self, order):
+        if order.type == Order.Types.BUY:
+            user = order.maker
+        else:
+            user = order.taker
+        if not user:
+            return None
+        try:
+            return str(user.robot.nostr_pubkey)
+        except Exception:
+            return None
 
     @sync_to_async
     def get_user_name(self, order):

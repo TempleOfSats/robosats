@@ -11,7 +11,7 @@ from rest_framework.authtoken.models import TokenProxy
 from api.logics import Logics
 from api.models import Currency, LNPayment, MarketTick, OnchainPayment, Order, Robot
 from api.utils import objects_to_hyperlinks
-from api.tasks import send_notification
+from api.tasks import send_notification, nostr_send_buyer_scam_report
 
 admin.site.unregister(Group)
 admin.site.unregister(User)
@@ -148,6 +148,7 @@ class OrderAdmin(AdminChangeLinksMixin, admin.ModelAdmin):
         "return_everything",
         "successful_trade",
         "compute_median_trade_time",
+        "report_buyer_scammer_notary",
     ]
 
     @admin.action(description="Close public order")
@@ -364,6 +365,28 @@ class OrderAdmin(AdminChangeLinksMixin, admin.ModelAdmin):
                 messages.ERROR,
             )
 
+    @admin.action(description="Report buyer as scammer (notary)")
+    def report_buyer_scammer_notary(self, request, queryset):
+        """
+        Publishes a coordinator-signed scam report for the buyer nostr pubkey to the notary relay.
+        """
+        for order in queryset:
+            buyer = order.maker if order.type == Order.Types.BUY else order.taker
+            if not buyer or not getattr(buyer, "robot", None) or not buyer.robot.nostr_pubkey:
+                self.message_user(
+                    request,
+                    f"Order {order.id}: missing buyer nostr pubkey",
+                    messages.ERROR,
+                )
+                continue
+
+            nostr_send_buyer_scam_report.delay(str(buyer.robot.nostr_pubkey))
+            self.message_user(
+                request,
+                f"Order {order.id}: buyer {buyer.username} was reported to notary",
+                messages.SUCCESS,
+            )
+
     def amt(self, obj):
         if obj.has_range and obj.amount is None:
             return str(float(obj.min_amount)) + "-" + str(float(obj.max_amount))
@@ -504,6 +527,7 @@ class UserRobotAdmin(AdminChangeLinksMixin, admin.ModelAdmin):
         "id",
         "user_link",
         "telegram_enabled",
+        "nostr_pubkey",
         "total_contracts",
         "earned_rewards",
         "claimed_rewards",
@@ -511,12 +535,36 @@ class UserRobotAdmin(AdminChangeLinksMixin, admin.ModelAdmin):
         "num_disputes",
         "lost_disputes",
     )
+    actions = ["report_robot_scammer_notary"]
     raw_id_fields = ("user",)
     list_editable = ["earned_rewards"]
     list_display_links = ["id"]
     change_links = ["user"]
     search_fields = ["user__username", "id"]
     readonly_fields = ("hash_id", "public_key", "encrypted_private_key")
+
+    @admin.action(description="Report robot as scammer (notary)")
+    def report_robot_scammer_notary(self, request, queryset):
+        """
+        Publishes a coordinator-signed scam report for a robot nostr pubkey to the notary relay.
+
+        This can be used when you only have the pubkey (robot) and not a specific order selected.
+        """
+        for robot in queryset:
+            if not robot.nostr_pubkey:
+                self.message_user(
+                    request,
+                    f"Robot {robot.id}: missing nostr pubkey",
+                    messages.ERROR,
+                )
+                continue
+
+            nostr_send_buyer_scam_report.delay(str(robot.nostr_pubkey))
+            self.message_user(
+                request,
+                f"Robot {robot.id} ({robot.user.username}) was reported to notary",
+                messages.SUCCESS,
+            )
 
 
 @admin.register(Currency)

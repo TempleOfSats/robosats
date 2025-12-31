@@ -15,6 +15,7 @@ import { type UseFederationStoreType, FederationContext } from '../../contexts/F
 import { useNavigate } from 'react-router-dom';
 import { sha256 } from 'js-sha256';
 import { UseAppStoreType, AppContext } from '../../contexts/AppContext';
+import { sendReputationLink } from '../../services/Reputation';
 
 interface TakeButtonProps {
   currentOrder: Order;
@@ -275,7 +276,7 @@ const TakeButton = ({
     }
   };
 
-  const takeOrder = function (): void {
+  const takeOrder = async (): Promise<void> => {
     const slot = garage.getSlot();
 
     if (currentOrder === null || slot === null) return;
@@ -284,21 +285,38 @@ const TakeButton = ({
 
     setLoadingTake(true);
 
-    slot
-      .takeOrder(federation, currentOrder, takeAmount)
-      .then((order) => {
-        if (order?.bad_request !== undefined) {
-          setBadRequest(order.bad_request);
-        } else {
-          setBadRequest('');
-          setCurrentOrder(order);
-          navigateToPage(`order/${order.shortAlias}/${order.id}`, navigate);
-        }
-        setLoadingTake(false);
-      })
-      .catch(() => {
-        setBadRequest('Request error');
-      });
+    const isBuyer = currentOrder.type === 1;
+    const activeSlot = slot;
+
+    if (isBuyer) {
+      const master = await garage.getReputationMaster();
+      if (master?.secKey && master.pubKey && activeSlot.nostrSecKey && activeSlot.nostrPubKey) {
+        sendReputationLink({
+          notary: federation.notaryPool,
+          ephemeralSecKey: activeSlot.nostrSecKey,
+          ephemeralPubKey: activeSlot.nostrPubKey,
+          masterSecKey: master.secKey,
+          masterPubKey: master.pubKey,
+        });
+        activeSlot.reputationMasterPubKey = master.pubKey;
+        garage.triggerHook('onSlotUpdate');
+      }
+    }
+
+    try {
+      const order = await activeSlot.takeOrder(federation, currentOrder, takeAmount);
+      if (order?.bad_request !== undefined) {
+        setBadRequest(order.bad_request);
+      } else {
+        setBadRequest('');
+        setCurrentOrder(order);
+        navigateToPage(`order/${order.shortAlias}/${order.id}`, navigate);
+      }
+    } catch {
+      setBadRequest('Request error');
+    } finally {
+      setLoadingTake(false);
+    }
   };
 
   return (
@@ -331,7 +349,7 @@ const TakeButton = ({
           setOpen({ ...open, confirmation: false });
         }}
         onClickDone={() => {
-          takeOrder();
+          void takeOrder();
           setLoadingTake(true);
           setOpen(closeAll);
         }}

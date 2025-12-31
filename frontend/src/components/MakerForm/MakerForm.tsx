@@ -46,6 +46,7 @@ import { GarageContext, type UseGarageStoreType } from '../../contexts/GarageCon
 import { useNavigate } from 'react-router-dom';
 import { sha256 } from 'js-sha256';
 import AddNewPaymentMethodDialog from '../Dialogs/AddNewPaymentMethodDialog';
+import { sendReputationLink } from '../../services/Reputation';
 
 interface MakerFormProps {
   disableRequest?: boolean;
@@ -231,7 +232,7 @@ const MakerForm = ({
       });
     };
 
-  const handleCreateOrder = function (): void {
+  const handleCreateOrder = async (): Promise<void> => {
     const slot = garage.getSlot();
 
     if (!disableRequest && maker.coordinator && slot) {
@@ -257,21 +258,37 @@ const MakerForm = ({
         description: maker.description ? maker.description : null,
       };
 
-      void slot
-        .makeOrder(federation, orderAttributes)
-        .then((order: Order) => {
-          if (order.id) {
-            navigateToPage(`order/${order.shortAlias}/${order.id}`, navigate);
-            clearMaker();
-          } else if (order?.bad_request) {
-            setBadRequest(order?.bad_request);
-          }
-          setSubmittingRequest(false);
-        })
-        .catch(() => {
-          setBadRequest('Request error');
-          setSubmittingRequest(false);
-        });
+      const isBuyer = orderAttributes.type === 0;
+      const activeSlot = slot;
+
+      if (isBuyer) {
+        const master = await garage.getReputationMaster();
+        if (master?.secKey && master.pubKey && activeSlot.nostrSecKey && activeSlot.nostrPubKey) {
+          sendReputationLink({
+            notary: federation.notaryPool,
+            ephemeralSecKey: activeSlot.nostrSecKey,
+            ephemeralPubKey: activeSlot.nostrPubKey,
+            masterSecKey: master.secKey,
+            masterPubKey: master.pubKey,
+          });
+          activeSlot.reputationMasterPubKey = master.pubKey;
+          garage.triggerHook('onSlotUpdate');
+        }
+      }
+
+      try {
+        const order: Order = await activeSlot.makeOrder(federation, orderAttributes);
+        if (order.id) {
+          navigateToPage(`order/${order.shortAlias}/${order.id}`, navigate);
+          clearMaker();
+        } else if (order?.bad_request) {
+          setBadRequest(order?.bad_request);
+        }
+      } catch {
+        setBadRequest('Request error');
+      } finally {
+        setSubmittingRequest(false);
+      }
     }
     setOpenDialogs(false);
   };

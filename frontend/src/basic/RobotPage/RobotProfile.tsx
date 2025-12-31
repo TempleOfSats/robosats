@@ -14,7 +14,7 @@ import {
   IconButton,
   Tooltip,
 } from '@mui/material';
-import { Key, Bolt, Add, DeleteSweep, Download, Settings } from '@mui/icons-material';
+import { Key, Bolt, Add, DeleteSweep, Download, Settings, MilitaryTech } from '@mui/icons-material';
 import RobotAvatar from '../../components/RobotAvatar';
 import TokenInput from './TokenInput';
 import { type Slot, type Robot } from '../../models';
@@ -24,6 +24,7 @@ import { LoadingButton } from '@mui/lab';
 import { GarageContext, type UseGarageStoreType } from '../../contexts/GarageContext';
 import { type UseFederationStoreType, FederationContext } from '../../contexts/FederationContext';
 import { DeleteRobotConfirmationDialog } from '../../components/Dialogs';
+import AuditPGPDialog from '../../components/Dialogs/AuditPGP';
 
 interface RobotProfileProps {
   robot: Robot;
@@ -53,6 +54,9 @@ const RobotProfile = ({
 
   const [loading, setLoading] = useState<boolean>(true);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState<boolean>(false);
+  const [reputationDialogOpen, setReputationDialogOpen] = useState<boolean>(false);
+  const [reputationEnabled, setReputationEnabled] = useState<boolean>(false);
+  const [reputationHasMasterKey, setReputationHasMasterKey] = useState<boolean>(false);
 
   useEffect(() => {
     const slot = garage.getSlot();
@@ -60,6 +64,15 @@ const RobotProfile = ({
       setLoading(false);
     }
   }, [slotUpdatedAt, loading]);
+
+  useEffect(() => {
+    void (async () => {
+      setReputationEnabled(await garage.getReputationEnabled());
+      setReputationHasMasterKey(await garage.hasReputationMasterKey());
+    })();
+  }, [slotUpdatedAt]);
+
+  const reputationActive = reputationEnabled && reputationHasMasterKey;
 
   const handleAddRobot = (): void => {
     const token = genBase62Token(36);
@@ -363,6 +376,27 @@ const RobotProfile = ({
                   <Key />
                 </Button>
               </Grid>
+	              <Grid item>
+	                <Tooltip
+	                  enterTouchDelay={0}
+	                  title={
+	                    !reputationEnabled
+	                      ? t('Buyer reputation (opt-in, currently disabled)')
+	                      : reputationHasMasterKey
+	                        ? t('Buyer reputation (enabled)')
+	                        : t('Buyer reputation (setup required)')
+	                  }
+	                >
+	                  <Button
+	                    color='primary'
+	                    size='large'
+	                    onClick={() => setReputationDialogOpen(true)}
+	                    sx={{ opacity: reputationActive ? 1 : 0.6 }}
+	                  >
+	                    <MilitaryTech color={reputationActive ? 'inherit' : 'disabled'} />
+	                  </Button>
+	                </Tooltip>
+	              </Grid>
               <Grid item>
                 <Button color='primary' onClick={handleDeleteRobot} size='large'>
                   <DeleteSweep />
@@ -379,6 +413,13 @@ const RobotProfile = ({
         onClose={handleCancelDelete}
         onConfirm={handleConfirmDelete}
         robotName={robot?.nickname}
+      />
+
+      <AuditPGPDialog
+        open={reputationDialogOpen}
+        initialTab='reputation'
+        onClose={() => setReputationDialogOpen(false)}
+        onClickBack={() => setReputationDialogOpen(false)}
       />
     </Grid>
   );

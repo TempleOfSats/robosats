@@ -13,6 +13,7 @@ import { coordinatorDefaultValues } from './Coordinator.model';
 import { updateExchangeInfo } from './Exchange.model';
 import eventToPublicOrder from '../utils/nostr';
 import RoboPool from '../services/RoboPool';
+import NotaryPool from '../services/NotaryPool';
 import { systemClient } from '../services/System';
 
 type FederationHooks = 'onFederationUpdate';
@@ -62,6 +63,7 @@ export class Federation {
     if (tesnetHost) this.network = 'testnet';
     this.connection = null;
     this.roboPool = new RoboPool(settings);
+    this.notaryPool = new NotaryPool(settings);
 
     if (settings.client === 'mobile') {
       const federationUrls = Object.values(this.coordinators).map((c) => c.getRelayUrl());
@@ -82,6 +84,7 @@ export class Federation {
   public hooks: Record<FederationHooks, Array<() => void>>;
 
   public roboPool: RoboPool;
+  public notaryPool: NotaryPool;
 
   setConnection = (
     origin: Origin,
@@ -98,6 +101,7 @@ export class Federation {
     const coordinators = Object.values(this.coordinators);
     coordinators.forEach((c) => c.updateUrl(origin, settings, hostUrl));
     this.roboPool.updateRelays(hostUrl, Object.values(this.coordinators));
+    this.notaryPool.updateConfig(settings);
 
     coordinators[0].loadLimits();
 

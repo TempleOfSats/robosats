@@ -281,6 +281,31 @@ def nostr_send_notification_event(robot_id=None, order_id=None, text=None):
     return
 
 
+@shared_task(name="", ignore_result=True, time_limit=120)
+def nostr_send_buyer_success_receipt(order_id=None):
+    if order_id:
+        from api.models import Order
+        from api.nostr import Nostr
+
+        order = Order.objects.get(id=order_id)
+
+        nostr = Nostr()
+        async_to_sync(nostr.send_buyer_success_receipt)(order)
+
+    return
+
+
+@shared_task(name="", ignore_result=True, time_limit=120)
+def nostr_send_buyer_scam_report(buyer_pubkey_hex=None, note=None):
+    if buyer_pubkey_hex:
+        from api.nostr import Nostr
+
+        nostr = Nostr()
+        async_to_sync(nostr.send_buyer_scam_report)(buyer_pubkey_hex, note or "")
+
+    return
+
+
 @shared_task(name="send_notification", ignore_result=True, time_limit=120)
 def send_notification(order_id=None, chat_message_id=None, message=None):
     if order_id:

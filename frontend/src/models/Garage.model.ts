@@ -1,8 +1,11 @@
 import { type Federation, Order } from '.';
 import { genKey } from '../pgp';
 import { systemClient } from '../services/System';
-import { saveAsJson } from '../utils';
+import { genBase62Token, saveAsJson } from '../utils';
 import Slot from './Slot.model';
+import { sha256 as sha256Hash } from '@noble/hashes/sha256';
+import { sha512 } from '@noble/hashes/sha512';
+import { getPublicKey, nip19 } from 'nostr-tools';
 
 type GarageHooks = 'onSlotUpdate';
 
@@ -10,6 +13,8 @@ class Garage {
   constructor() {
     this.slots = {};
     this.currentSlot = null;
+    this.reputationMasterNsec = null;
+    this.reputationEnabled = null;
 
     this.hooks = {
       onSlotUpdate: [],
@@ -20,6 +25,8 @@ class Garage {
 
   slots: Record<string, Slot>;
   currentSlot: string | null;
+  private reputationMasterNsec: string | null;
+  private reputationEnabled: boolean | null;
 
   hooks: Record<GarageHooks, Array<() => void>>;
 
@@ -74,6 +81,9 @@ class Garage {
               this.triggerHook('onSlotUpdate');
             },
           );
+          this.slots[rawSlot.token].reputationMasterPubKey =
+            (rawSlot as { reputationMasterPubKey?: string | null }).reputationMasterPubKey ??
+            null;
           this.slots[rawSlot.token].updateSlotFromOrder(new Order(rawSlot.lastOrder));
           this.slots[rawSlot.token].updateSlotFromOrder(new Order(rawSlot.activeOrder));
         }
@@ -84,6 +94,99 @@ class Garage {
       console.log('Robot Garage was loaded from local storage');
       this.triggerHook('onSlotUpdate');
     }
+  };
+
+  // Reputation master identity (buyer reputation system)
+  getReputationEnabled = async (): Promise<boolean> => {
+    if (this.reputationEnabled != null) return this.reputationEnabled;
+    const stored = (await systemClient.getItem('garage_reputation_enabled')) ?? '';
+    // Default is opt-out (badge is optional).
+    this.reputationEnabled = stored === '1' || stored === 'true';
+    return this.reputationEnabled;
+  };
+
+  setReputationEnabled = async (enabled: boolean): Promise<void> => {
+    systemClient.setItem('garage_reputation_enabled', enabled ? '1' : '0');
+    this.reputationEnabled = enabled;
+    this.triggerHook('onSlotUpdate');
+  };
+
+  hasReputationMasterKey = async (): Promise<boolean> => {
+    const storedNsec = (await systemClient.getItem('garage_reputation_master_nsec')) ?? '';
+    if (storedNsec.trim() !== '') return true;
+    const legacyToken = (await systemClient.getItem('garage_reputation_master_token')) ?? '';
+    return legacyToken.trim() !== '';
+  };
+
+  ensureReputationMasterKey = async (): Promise<void> => {
+    if (this.reputationMasterNsec) return;
+
+    const storedNsec = (await systemClient.getItem('garage_reputation_master_nsec')) ?? '';
+    if (storedNsec !== '') {
+      this.reputationMasterNsec = storedNsec;
+      return;
+    }
+
+    // Legacy migration: if the old token exists, convert it once to a nostr nsec and persist it.
+    const legacyToken = (await systemClient.getItem('garage_reputation_master_token')) ?? '';
+    if (legacyToken !== '') {
+      const legacySecKey = sha256Hash(sha512(legacyToken));
+      const nsec = nip19.nsecEncode(legacySecKey);
+      systemClient.setItem('garage_reputation_master_nsec', nsec);
+      this.reputationMasterNsec = nsec;
+      return;
+    }
+  };
+
+  getReputationMaster = async (): Promise<
+    { nsec: string; secKey: Uint8Array; pubKey: string } | null
+  > => {
+    const enabled = await this.getReputationEnabled();
+    if (!enabled) return null;
+    await this.ensureReputationMasterKey();
+    if (!this.reputationMasterNsec) return null;
+
+    try {
+      const decoded = nip19.decode(this.reputationMasterNsec);
+      if (decoded.type !== 'nsec') return null;
+      const secKey = decoded.data as Uint8Array;
+      const pubKey = getPublicKey(secKey);
+      return { nsec: this.reputationMasterNsec, secKey, pubKey };
+    } catch {
+      return null;
+    }
+  };
+
+  setReputationMasterNsec = async (nsec: string): Promise<boolean> => {
+    const trimmed = (nsec ?? '').trim();
+    try {
+      const decoded = nip19.decode(trimmed);
+      if (decoded.type !== 'nsec') return false;
+      systemClient.setItem('garage_reputation_master_nsec', trimmed);
+      this.reputationMasterNsec = trimmed;
+      this.triggerHook('onSlotUpdate');
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  regenerateReputationMaster = async (): Promise<void> => {
+    let secKey: Uint8Array | null = null;
+    try {
+      secKey = globalThis.crypto?.getRandomValues(new Uint8Array(32)) ?? null;
+    } catch {
+      secKey = null;
+    }
+    if (!secKey) {
+      const token = genBase62Token(36);
+      secKey = sha256Hash(sha512(token));
+    }
+
+    const nsec = nip19.nsecEncode(secKey);
+    systemClient.setItem('garage_reputation_master_nsec', nsec);
+    this.reputationMasterNsec = nsec;
+    this.triggerHook('onSlotUpdate');
   };
 
   // Slots
@@ -129,8 +232,12 @@ class Garage {
   };
 
   // Robots
-  createRobot: (federation: Federation, token: string, skipSelect?: boolean) => Promise<void> =
-    async (federation, token, skipSelect) => {
+  createRobot: (
+    federation: Federation,
+    token: string,
+    skipSelect?: boolean,
+    shortAliases?: string[],
+  ) => Promise<void> = async (federation, token, skipSelect, shortAliases) => {
       if (!token) return;
 
       if (this.getSlot(token) === null) {
@@ -144,9 +251,14 @@ class Garage {
 
           if (!skipSelect) this.setCurrentSlot(token);
 
+          const coordinatorAliases =
+            shortAliases && shortAliases.length > 0
+              ? shortAliases
+              : federation.getCoordinatorsAlias();
+
           this.slots[token] = new Slot(
             token,
-            federation.getCoordinatorsAlias(),
+            coordinatorAliases,
             robotAttributes,
             () => {
               this.triggerHook('onSlotUpdate');

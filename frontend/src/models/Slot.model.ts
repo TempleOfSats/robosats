@@ -61,6 +61,7 @@ class Slot {
   lastOrder: Order | null = null;
   nostrSecKey?: Uint8Array;
   nostrPubKey?: string;
+  reputationMasterPubKey?: string | null = null;
   availableRewards: string | null = null;
   loading: boolean;
 
